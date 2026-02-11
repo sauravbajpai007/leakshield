@@ -48,7 +48,9 @@ jobs:
             --config=gitleaks.toml \
             --report-format json \
             --report-path gitleaks-report.json \
-            --redact || true
+            --exit-code 1 \
+            --redact
+        continue-on-error: true
 
       # ---------------------------------
       # Ensure report file always exists
@@ -107,25 +109,92 @@ jobs:
       # Create GitHub Issue (ONLY on push)
       # ---------------------------------
       - name: Create GitHub Issue
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && steps.gitleaks.outcome == 'failure'
         uses: actions/github-script@v7
         with:
           script: |
-            const fs = require('fs');
-            const findings = JSON.parse(fs.readFileSync('gitleaks-report.json', 'utf8'));
+            const title = 'Secrets detected by Gitleaks';
 
-            if (findings.length === 0) {
-              console.log('No secrets found. Skipping issue creation.');
-              return;
-            }
+            const body = `
+            **Security Alert**
 
-            await github.rest.issues.create({
+            Secrets were detected in the repository.
+
+            **Repository:** ${context.repo.owner}/${context.repo.repo}
+            **Branch:** ${context.ref.replace('refs/heads/', '')}
+            **Commit:** ${context.sha}
+            **Triggered by:** ${context.actor}
+
+            Action required:
+            - Remove the secret from the codebase
+            - Rotate the exposed credentials immediately
+
+            ---
+            _This issue was automatically created by github-actions[bot]._
+            `;
+
+            const { data: issues } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: "🔴 Secrets detected by Gitleaks",
-              body: `Gitleaks detected **${findings.length}** secrets.\n\nPlease rotate credentials immediately.`,
-              labels: ["security", "gitleaks"]
+              state: 'open',
+              labels: 'security,gitleaks'
             });
+
+            const existingIssue = issues.find(issue => issue.title === title);
+
+            if (!existingIssue) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['security', 'gitleaks', 'automated']
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: existingIssue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `
+                New secret detected
+
+                **Commit:** ${context.sha}
+                **Triggered by:** @${context.actor}
+                `
+              });
+            }
+
+
+      # ---------------------------------
+      # Send external email alert on secret detection
+      # ---------------------------------
+      - name: Send Email Alert
+        if: steps.gitleaks.outcome == 'failure'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "🚨 Gitleaks Alert: Secrets detected in ${{ github.repository }}"
+          to: ${{ secrets.ALERT_EMAILS }}
+          from: "Gitleaks CI <${{ secrets.SMTP_USERNAME }}>"
+          body: |
+            🚨 SECURITY ALERT
+
+            Gitleaks detected secrets in the repository.
+
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Actor: ${{ github.actor }}
+
+            Immediate actions required:
+            - Remove the exposed secret
+            - Rotate the credential immediately
+            - Re-run the pipeline
+
+            This alert was sent automatically by GitHub Actions.
 
       # ---------------------------------
       # FAIL pipeline if secrets found
